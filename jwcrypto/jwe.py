@@ -367,6 +367,12 @@ class JWE:
     # FIXME: allow to specify which algorithms to accept as valid
     def _decrypt(self, key, ppe, max_plaintext=default_max_plaintext_size):
 
+        # Clear any key produced by a previous (possibly failed) recipient
+        # attempt. The CEK is only assigned on a successful authenticated
+        # unwrap below, so leaving an old value here would expose a stale key
+        # on this object when this attempt fails afterwards.
+        self.cek = None
+
         jh = self._get_jose_header(ppe.get('header', None))
 
         # TODO: allow caller to specify list of headers it understands
@@ -423,13 +429,24 @@ class JWE:
                 raise InvalidJWEData(
                     'Compressed data exceeds maximum allowed'
                     'size' + f' ({default_max_compressed_size})')
+            # Decompress into a local buffer first. Authentication has passed
+            # at this point, but the compressed stream itself may still be
+            # corrupt or exceed the size limit; only publish plaintext and
+            # cek on the object once decompression fully succeeds, otherwise
+            # a failed attempt would leave partial plaintext and a usable CEK
+            # behind.
             do = zlib.decompressobj(wbits=-zlib.MAX_WBITS)
-            self.plaintext = do.decompress(data, max_plaintext)
-            if do.unconsumed_tail or not do.eof:
+            try:
+                plaintext = do.decompress(data, max_plaintext)
+                if do.unconsumed_tail or not do.eof:
+                    raise InvalidJWEData(
+                        'Compressed data exceeds maximum allowed'
+                        'output size' + f' ({max_plaintext})')
+            except Exception:
+                self.cek = None
                 self.plaintext = None
-                raise InvalidJWEData(
-                    'Compressed data exceeds maximum allowed'
-                    'output size' + f' ({max_plaintext})')
+                raise
+            self.plaintext = plaintext
         elif compress is None:
             self.plaintext = data
         else:
@@ -454,6 +471,11 @@ class JWE:
         """
 
         self.plaintext = None
+        # Reset the content encryption key as well, so a failed decryption
+        # attempt cannot leave the key from a previous success exposed on
+        # this object (plaintext is cleared above; cek must be treated the
+        # same way).
+        self.cek = None
         if max_plaintext == 0:
             max_plaintext = default_max_plaintext_size
 
