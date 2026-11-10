@@ -3,6 +3,7 @@
 from __future__ import unicode_literals
 
 import copy
+import os
 import unittest
 
 from cryptography.hazmat.backends import default_backend
@@ -20,6 +21,8 @@ from jwcrypto.common import JWSEHeaderParameter
 from jwcrypto.common import base64url_decode, base64url_encode
 from jwcrypto.common import json_decode, json_encode
 
+
+here = os.path.dirname(os.path.abspath(__file__))
 
 jwe_algs_and_rsa1_5 = jwe.default_allowed_algs + ['RSA1_5']
 
@@ -2196,13 +2199,325 @@ class TestJWT(unittest.TestCase):
         token = jwt.JWT(header={"alg": "HS256"}, claims=claims)
         token.make_signed_token(key)
         sertok = token.serialize()
-        for invalid in ["123", True, False, 12.34, [1], {"a": 1}]:
+        # NumericDate is a JSON number: bool, strings, lists and dicts
+        # are never accepted (floats, including fractional seconds, are)
+        for invalid in ["123", True, False, [1], {"a": 1}]:
             self.assertRaises(jwt.JWTInvalidClaimFormat, jwt.JWT, key=key,
                               jwt=sertok, check_claims={"exp": invalid})
             self.assertRaises(jwt.JWTInvalidClaimFormat, jwt.JWT, key=key,
                               jwt=sertok, check_claims={"nbf": invalid})
             self.assertRaises(jwt.JWTInvalidClaimFormat, jwt.JWT, key=key,
                               jwt=sertok, check_claims={"iat": invalid})
+
+    def test_numericdate_accepted_types(self):
+        # ints and finite floats (fractional seconds) are NumericDates;
+        # bool, NaN, infinity and numeric strings are rejected.
+        key = jwk.JWK(generate='oct', size=256)
+        base = 1000000000
+        valid_claims = [
+            {"iat": base, "nbf": base, "exp": base + 10},
+            {"iat": base + 0.25, "nbf": base + 0.5, "exp": base + 10.75},
+        ]
+        for claims in valid_claims:
+            tok = jwt.JWT(header={"alg": "HS256"}, claims=claims)
+            tok.make_signed_token(key)
+            jwt.JWT(jwt=tok.serialize(), key=key, now=base + 5,
+                    check_claims=False)
+
+        invalid_claims = [
+            {"exp": True},
+            {"exp": False},
+            {"nbf": True},
+            {"iat": False},
+            {"exp": "1000000010"},
+            {"nbf": "1000000000"},
+            {"iat": "1000000000"},
+            {"exp": float('nan')},
+            {"exp": float('inf')},
+            {"exp": float('-inf')},
+            {"nbf": float('nan')},
+            {"iat": float('inf')},
+        ]
+        for claims in invalid_claims:
+            s = jws.JWS(json_encode(claims))
+            s.add_signature(key, protected={"alg": "HS256"})
+            sertok = s.serialize(compact=True)
+            self.assertRaises(jwt.JWTInvalidClaimFormat, jwt.JWT,
+                              jwt=sertok, key=key)
+            # the rejection must not leave claims accessible
+            bad = jwt.JWT()
+            with self.assertRaises(jwt.JWTInvalidClaimFormat):
+                bad.deserialize(sertok, key)
+            with self.assertRaises(KeyError):
+                bad.claims
+
+    def _make_time_token(self, key, claims):
+        token = jwt.JWT(header={"alg": "HS256"}, claims=claims)
+        token.make_signed_token(key)
+        return token.serialize()
+
+    def test_exp_boundaries_with_now(self):
+        key = jwk.JWK(generate='oct', size=256)
+        exp = 1000.0
+        sertok = self._make_time_token(key, {"exp": exp})
+
+        # before the boundary (with room for the 60s default leeway)
+        jwt.JWT(jwt=sertok, key=key, now=exp - 59)
+        # exactly at the boundary
+        jwt.JWT(jwt=sertok, key=key, now=exp)
+        # exactly at the leeway edge: exp == now - leeway is accepted
+        jwt.JWT(jwt=sertok, key=key, now=exp + 60)
+        # just past the leeway edge is rejected
+        with self.assertRaises(jwt.JWTExpired):
+            jwt.JWT(jwt=sertok, key=key, now=exp + 60.001)
+        # well after the boundary
+        with self.assertRaises(jwt.JWTExpired):
+            jwt.JWT(jwt=sertok, key=key, now=exp + 120)
+
+    def test_nbf_boundaries_with_now(self):
+        key = jwk.JWK(generate='oct', size=256)
+        nbf = 2000.0
+        sertok = self._make_time_token(key, {"nbf": nbf})
+
+        # before the boundary, within the 60s default leeway
+        jwt.JWT(jwt=sertok, key=key, now=nbf - 60)
+        with self.assertRaises(jwt.JWTNotYetValid):
+            jwt.JWT(jwt=sertok, key=key, now=nbf - 60.001)
+        # exactly at the boundary
+        jwt.JWT(jwt=sertok, key=key, now=nbf)
+        # after the boundary
+        jwt.JWT(jwt=sertok, key=key, now=nbf + 30)
+
+    def test_iat_future_boundaries_with_now(self):
+        key = jwk.JWK(generate='oct', size=256)
+        iat = 3000.0
+        sertok = self._make_time_token(key, {"iat": iat})
+
+        # future iat within leeway is tolerated
+        jwt.JWT(jwt=sertok, key=key, now=iat - 60)
+        # exactly at the leeway edge
+        jwt.JWT(jwt=sertok, key=key, now=iat - 60.0)
+        with self.assertRaises(jwt.JWTNotYetValid):
+            jwt.JWT(jwt=sertok, key=key, now=iat - 60.001)
+        # iat in the past and exactly equal to now
+        jwt.JWT(jwt=sertok, key=key, now=iat)
+        jwt.JWT(jwt=sertok, key=key, now=iat + 5)
+
+    def test_fractional_seconds_and_leeway_combinations(self):
+        key = jwk.JWK(generate='oct', size=256)
+
+        # fractional exp: boundary comparisons must not be truncated
+        sertok = self._make_time_token(key, {"exp": 100.5})
+        jwt.JWT(jwt=sertok, key=key, now=100.5)
+        jwt.JWT(jwt=sertok, key=key, now=160.5)  # exactly leeway edge
+        with self.assertRaises(jwt.JWTExpired):
+            jwt.JWT(jwt=sertok, key=key, now=160.51)
+
+        # custom leeway combined with fractional nbf
+        token = jwt.JWT(header={"alg": "HS256"},
+                        claims={"nbf": 100.25})
+        token.make_signed_token(key)
+        sertok = token.serialize()
+        verifier = jwt.JWT()
+        verifier.leeway = 10
+        verifier.deserialize(sertok, key, now=90.25)
+        with self.assertRaises(jwt.JWTNotYetValid):
+            verifier.deserialize(sertok, key, now=90.0)
+        verifier.deserialize(sertok, key, now=100.25)
+
+        # zero leeway makes the boundary strict
+        token = jwt.JWT(header={"alg": "HS256"},
+                        claims={"exp": 50.5, "iat": 40.5})
+        token.make_signed_token(key)
+        sertok = token.serialize()
+        strict = jwt.JWT()
+        strict.leeway = 0
+        strict.deserialize(sertok, key, now=50.5)
+        with self.assertRaises(jwt.JWTExpired):
+            strict.deserialize(sertok, key, now=50.51)
+
+        # future fractional iat plus leeway
+        token = jwt.JWT(header={"alg": "HS256"},
+                        claims={"iat": 75.75})
+        token.make_signed_token(key)
+        sertok = token.serialize()
+        verifier = jwt.JWT()
+        verifier.leeway = 5
+        verifier.deserialize(sertok, key, now=70.75)
+        with self.assertRaises(jwt.JWTNotYetValid):
+            verifier.deserialize(sertok, key, now=70.74)
+
+    def test_single_time_used_for_all_claims(self):
+        key = jwk.JWK(generate='oct', size=256)
+        # exp and nbf straddle a single point in time; both must use it
+        claims = {"nbf": 990.0, "exp": 1010.0, "iat": 990.0}
+        sertok = self._make_time_token(key, claims)
+        # one value is shared: valid window with default leeway
+        jwt.JWT(jwt=sertok, key=key, now=1000)
+        with self.assertRaises(jwt.JWTNotYetValid):
+            jwt.JWT(jwt=sertok, key=key, now=900)
+        with self.assertRaises(jwt.JWTExpired):
+            jwt.JWT(jwt=sertok, key=key, now=1100)
+
+    def test_max_token_age_enforcement(self):
+        key = jwk.JWK(generate='oct', size=256)
+        base = 5000.0
+
+        # token within the max lifetime
+        sertok = self._make_time_token(
+            key, {"iat": base, "exp": base + 60})
+        jwt.JWT(jwt=sertok, key=key, now=base + 30, max_token_age=60)
+        # lifetime equal to the cap is allowed, leeway does not extend it
+        jwt.JWT(jwt=sertok, key=key, now=base + 30, max_token_age=60.0)
+        with self.assertRaises(jwt.JWTExpired):
+            jwt.JWT(jwt=sertok, key=key, now=base + 30, max_token_age=59)
+
+        # fractional lifetime
+        sertok = self._make_time_token(
+            key, {"iat": base, "exp": base + 10.5})
+        jwt.JWT(jwt=sertok, key=key, now=base + 5, max_token_age=10.5)
+        with self.assertRaises(jwt.JWTExpired):
+            jwt.JWT(jwt=sertok, key=key, now=base + 5, max_token_age=10.49)
+
+        # missing iat or exp cannot pass on "not expired yet" alone
+        sertok = self._make_time_token(key, {"exp": base + 60})
+        with self.assertRaises(jwt.JWTMissingClaim):
+            jwt.JWT(jwt=sertok, key=key, now=base, max_token_age=120)
+        sertok = self._make_time_token(key, {"iat": base})
+        with self.assertRaises(jwt.JWTMissingClaim):
+            jwt.JWT(jwt=sertok, key=key, now=base, max_token_age=120)
+
+        # exp preceding iat is rejected
+        sertok = self._make_time_token(
+            key, {"iat": base + 60, "exp": base})
+        with self.assertRaises(jwt.JWTInvalidClaimValue):
+            jwt.JWT(jwt=sertok, key=key, now=base, max_token_age=120)
+
+        # max age does not relax exp: an expired token is still expired
+        sertok = self._make_time_token(
+            key, {"iat": base, "exp": base + 10})
+        with self.assertRaises(jwt.JWTExpired):
+            jwt.JWT(jwt=sertok, key=key, now=base + 200,
+                    max_token_age=1000)
+
+        # configured on the object, overridden or disabled per call
+        token = jwt.JWT(jwt=sertok, key=key, now=base + 5,
+                        max_token_age=10)
+        self.assertEqual(token.max_token_age, 10)
+        with self.assertRaises(jwt.JWTExpired):
+            jwt.JWT(jwt=sertok, key=key, now=base + 5, max_token_age=5)
+        # explicit None disables the cap for this call
+        jwt.JWT(jwt=sertok, key=key, now=base + 5, max_token_age=None)
+
+    def test_max_token_age_rejects_bad_arguments(self):
+        for bad in ["10", True, False, float('nan'), float('inf'), [10]]:
+            with self.assertRaises(jwt.JWTInvalidClaimFormat):
+                jwt.JWT(now=bad)
+            with self.assertRaises(jwt.JWTInvalidClaimFormat):
+                jwt.JWT(max_token_age=bad)
+        with self.assertRaises(ValueError):
+            jwt.JWT(max_token_age=-1)
+        obj = jwt.JWT()
+        with self.assertRaises(jwt.JWTInvalidClaimFormat):
+            obj.now = "123"
+        with self.assertRaises(jwt.JWTInvalidClaimFormat):
+            obj.max_token_age = float('inf')
+        with self.assertRaises(ValueError):
+            obj.max_token_age = -0.5
+        self.assertIsNone(obj.now)
+        self.assertIsNone(obj.max_token_age)
+
+    def test_now_reproducible_and_default(self):
+        key = jwk.JWK(generate='oct', size=256)
+        sertok = self._make_time_token(key, {"exp": 8000.0})
+
+        # the same fixed inputs always produce the same verdict
+        jwt.JWT(jwt=sertok, key=key, now=8000)
+        jwt.JWT(jwt=sertok, key=key, now=8000)
+        with self.assertRaises(jwt.JWTExpired):
+            jwt.JWT(jwt=sertok, key=key, now=9000)
+        with self.assertRaises(jwt.JWTExpired):
+            jwt.JWT(jwt=sertok, key=key, now=9000)
+
+        # object-level default now applies to deserialize/validate
+        obj = jwt.JWT(now=8000)
+        obj.deserialize(sertok, key)
+        obj2 = jwt.JWT()
+        obj2.deserialize(sertok)
+        obj2.now = 8000
+        obj2.validate(key)
+
+        # per-call value wins over the object default
+        with self.assertRaises(jwt.JWTExpired):
+            obj.validate(key, now=9000)
+        jwt.JWT(jwt=sertok, key=key, now=8000)
+
+        # default path (no now) still uses system time and rejects
+        # this ancient token
+        with self.assertRaises(jwt.JWTExpired):
+            jwt.JWT(jwt=sertok, key=key)
+
+    def test_signature_checked_before_claims_and_no_stale_claims(self):
+        key = jwk.JWK(generate='oct', size=256)
+        other = jwk.JWK(generate='oct', size=256)
+        sertok = self._make_time_token(
+            key, {"iat": 1.0, "exp": 10.0})
+
+        # a valid object first, then re-deserializing a token signed by
+        # another key must fail on the signature and clear old claims
+        good = jwt.JWT(jwt=sertok, key=key, now=5, max_token_age=10)
+        self.assertIn('exp', good.claims)
+        with self.assertRaises(jws.InvalidJWSSignature):
+            good.deserialize(sertok, other, now=5, max_token_age=10)
+        with self.assertRaises(KeyError):
+            good.claims
+
+        # claims failure also clears stale claims (default leeway 60,
+        # so now must be past exp + leeway to be expired)
+        good = jwt.JWT(jwt=sertok, key=key, now=5, max_token_age=10)
+        with self.assertRaises(jwt.JWTExpired):
+            jwt.JWT(jwt=sertok, key=key, now=100, max_token_age=10)
+        # a failed re-validation on the same object must wipe its claims
+        with self.assertRaises(jwt.JWTExpired):
+            good.deserialize(sertok, key, now=100, max_token_age=10)
+        with self.assertRaises(KeyError):
+            good.claims
+
+        # signature failure takes precedence even if the token would
+        # fail claims checks at the given time too
+        with self.assertRaises(jws.InvalidJWSSignature):
+            jwt.JWT(jwt=sertok, key=other, now=9999999999)
+
+    def test_replay_script_deterministic(self):
+        import subprocess
+        import sys
+        key = jwk.JWK(generate='oct', size=256)
+        sertok = self._make_time_token(
+            key, {"iat": 100.0, "exp": 110.0})
+        script = os.path.join(here, 'jwt_replay.py')
+
+        def run(extra):
+            proc = subprocess.run(
+                [sys.executable, script, '--token', sertok,
+                 '--key', key.export(), '--now', '105'] + extra,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return proc.returncode, proc.stdout.decode()
+
+        rc1, out1 = run([])
+        rc2, out2 = run([])
+        self.assertEqual(rc1, 0)
+        self.assertEqual(rc2, 0)
+        self.assertEqual(out1, out2)
+        self.assertIn('ACCEPTED', out1)
+
+        rc, out = run(['--max-token-age', '5'])
+        self.assertEqual(rc, 1)
+        self.assertIn('REJECTED', out)
+
+        rc, out = run(['--max-token-age', '10'])
+        self.assertEqual(rc, 0)
+        self.assertIn('ACCEPTED', out)
+
 
     def test_payload_claims_format(self):
         key = jwk.JWK(generate='oct', size=256)
@@ -2220,6 +2535,11 @@ class TestJWT(unittest.TestCase):
             '{"nbf": false}',
             '{"exp": "9999999999"}',
             '{"exp": [1]}',
+            '{"exp": NaN}',
+            '{"exp": Infinity}',
+            '{"exp": -Infinity}',
+            '{"nbf": NaN}',
+            '{"iat": Infinity}',
         ]
         for bad in bad_payloads:
             s = jws.JWS(bad)
@@ -2832,7 +3152,8 @@ class TestOverloadedOperators(unittest.TestCase):
                         claims={"info": "I'm a signed token"})
         strrep = 'JWT(header={"alg":"HS256"}, claims={"info":"I\'m a ' + \
                  'signed token"}, jwt=None, key=None, algs=None, ' + \
-                 'default_claims=None, check_claims=None)'
+                 'default_claims=None, check_claims=None, now=None, ' + \
+                 'max_token_age=None)'
         self.assertEqual(str(token), strrep)
         self.assertEqual(repr(token), strrep)
         token.make_signed_token(key)
@@ -2844,7 +3165,8 @@ class TestOverloadedOperators(unittest.TestCase):
         reprrep = 'JWT(header={"alg":"HS256"}, ' + \
                   'claims={"info":"I\'m a signed token"}, ' + \
                   f'jwt=JWS.from_json_token("{ser2}"), key=None, ' + \
-                  'algs=None, default_claims=None, check_claims=None)'
+                  'algs=None, default_claims=None, check_claims=None, ' + \
+                  'now=None, max_token_age=None)'
         self.assertEqual(repr(token), reprrep)
 
     def test_jwt_strict_serialization_jws(self):

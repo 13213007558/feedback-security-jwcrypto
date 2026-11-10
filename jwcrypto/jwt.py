@@ -1,6 +1,7 @@
 # Copyright (C) 2015  JWCrypto Project Contributors - see LICENSE file
 
 import copy
+import math
 import time
 import uuid
 
@@ -35,6 +36,29 @@ JWT_expect_type = True
    immediately refactored to deal with the change in behavior but it
    is considered deprecated and will be removed in a future release.
 """
+
+
+# Sentinel used to tell "no per-call value provided" from an explicit None
+_UNSET = object()
+
+
+def _validate_numericdate(value, name):
+    """Validate a NumericDate value (RFC 7519, section 2).
+
+    A NumericDate is a JSON number: an int or a float. Booleans are
+    rejected even though bool is a subclass of int. Floats must be
+    finite, so NaN and positive/negative infinity are rejected. Numeric
+    strings, lists, dicts and None are not numbers and are rejected too.
+    Returns the validated value unchanged.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise JWTInvalidClaimFormat(
+            "Claim %s is not a NumericDate, must be a JSON number"
+            % (name, ))
+    if isinstance(value, float) and not math.isfinite(value):
+        raise JWTInvalidClaimFormat(
+            "Claim %s is not a finite NumericDate" % (name, ))
+    return value
 
 
 class JWTExpired(JWException):
@@ -168,7 +192,8 @@ class JWT:
 
     def __init__(self, header=None, claims=None, jwt=None, key=None,
                  algs=None, default_claims=None, check_claims=None,
-                 expected_type=None, strict_serialization=False):
+                 expected_type=None, strict_serialization=False,
+                 now=None, max_token_age=None):
         """Creates a JWT object.
 
         :param header: A dict or a JSON string with the JWT Header data.
@@ -185,7 +210,7 @@ class JWT:
          present in the token, if the value is not None the claim must
          match exactly.
         :param expected_type: An optional string that defines what kind
-         of token to expect when validating a deserialized token.
+         token to expect when validating a deserialized token.
          Supported values: "JWS" or "JWE"
          If left to None the code will try to detect what the expected
          type is based on other parameters like 'algs' and will default
@@ -197,6 +222,24 @@ class JWT:
          so only the compact representation is accepted. The default is
          False to preserve backwards compatibility. It has no effect on
          token creation, which always produces the compact serialization.
+        :param now: An optional NumericDate (int or finite float, seconds
+         since the epoch) used as the verification time for the 'exp',
+         'nbf' and 'iat' claims. It is captured once per validation and
+         shared by all time-based checks so results are reproducible.
+         When None the current system time is captured at validation
+         time, preserving the default behavior. A value provided here is
+         used as the default for per-call values passed to
+         :meth:`validate` or :meth:`deserialize`.
+        :param max_token_age: An optional non-negative NumericDate that
+         enables a hard upper bound, in seconds, on the token lifetime
+         ('exp' - 'iat'). When set, both 'iat' and 'exp' must be present
+         and well-formed NumericDates, 'exp' must not precede 'iat', and
+         'exp' - 'iat' must not exceed this value. The check is
+         independent of the leeway and is applied in addition to the
+         regular 'exp'/'nbf' checks; a token cannot pass on "not expired
+         yet" alone. A value provided here is used as the default for
+         per-call values passed to :meth:`validate` or
+         :meth:`deserialize`.
 
         Note: either the header,claims or jwt,key parameters should be
         provided as a deserialization operation (which occurs if the jwt
@@ -207,6 +250,15 @@ class JWT:
         are checked if they are set on the token but not enforced if not
         set. Any other RFC 7519 registered claims are checked only for
         format conformance.
+
+        Note: the time-based claims 'exp', 'nbf' and 'iat' are
+        NumericDates (RFC 7519 section 2): JSON numbers, i.e. int or
+        finite float values, which allows fractional seconds. Booleans,
+        NaN, (negative) infinity, numeric strings and other non-number
+        types are always rejected with a JWTInvalidClaimFormat error.
+        The leeway is applied symmetrically: a token is accepted when
+        claim - leeway <= now for 'exp' and claim <= now + leeway for
+        'nbf' and 'iat'.
         """
 
         self._header = None
@@ -217,9 +269,17 @@ class JWT:
         self._check_claims = None
         self._leeway = 60  # 1 minute clock skew allowed
         self._validity = 600  # 10 minutes validity (up to 11 with leeway)
+        self._now = None
+        self._max_token_age = None
         self.deserializelog = None
         self._expected_type = expected_type
         self._strict_serialization = strict_serialization
+
+        # Validate and store the optional verification parameters
+        if now is not None:
+            self.now = now
+        if max_token_age is not None:
+            self.max_token_age = max_token_age
 
         if header:
             self.header = header
@@ -296,7 +356,10 @@ class JWT:
 
     @leeway.setter
     def leeway(self, lwy):
-        self._leeway = int(lwy)
+        # Accept ints and finite floats; bool is not a valid number.
+        self._leeway = _validate_numericdate(lwy, 'leeway')
+        if self._leeway < 0:
+            raise ValueError("leeway must not be negative")
 
     @property
     def validity(self):
@@ -305,6 +368,29 @@ class JWT:
     @validity.setter
     def validity(self, v):
         self._validity = int(v)
+
+    @property
+    def now(self):
+        """Default verification time (NumericDate), or None for system
+        time captured at validation time."""
+        return self._now
+
+    @now.setter
+    def now(self, value):
+        self._now = _validate_numericdate(value, 'now')
+
+    @property
+    def max_token_age(self):
+        """Optional hard cap on the token lifetime ('exp' - 'iat'),
+        in seconds, or None to disable the check."""
+        return self._max_token_age
+
+    @max_token_age.setter
+    def max_token_age(self, value):
+        value = _validate_numericdate(value, 'max_token_age')
+        if value < 0:
+            raise ValueError("max_token_age must not be negative")
+        self._max_token_age = value
 
     def _expected_type_heuristics(self, key=None):
         if self._expected_type is None and self._algs:
@@ -448,54 +534,95 @@ class JWT:
             raise JWTInvalidClaimFormat(
                 "Claim %s is not a StringOrURI type" % (name, ))
 
-    def _check_integer_claim(self, name, claims):
+    def _check_numericdate_claim(self, name, claims):
         if name not in claims or claims[name] is None:
             return
-        if isinstance(claims[name], bool):
-            raise JWTInvalidClaimFormat(
-                "Claim %s is not an integer" % (name, ))
-        if not isinstance(claims[name], int):
-            raise JWTInvalidClaimFormat(
-                "Claim %s is not an integer" % (name, ))
+        _validate_numericdate(claims[name], name)
 
     def _check_exp(self, claim, limit, leeway):
+        # accept when: now <= exp + leeway, i.e. exp >= now - leeway
         if claim < limit - leeway:
-            raise JWTExpired('Expired at %d, time: %d(leeway: %d)' % (
+            raise JWTExpired('Expired at %s, time: %s(leeway: %s)' % (
                              claim, limit, leeway))
 
     def _check_nbf(self, claim, limit, leeway):
+        # accept when: nbf <= now + leeway
         if claim > limit + leeway:
-            raise JWTNotYetValid('Valid from %d, time: %d(leeway: %d)' % (
+            raise JWTNotYetValid('Valid from %s, time: %s(leeway: %s)' % (
                                  claim, limit, leeway))
 
-    def _check_default_claims(self, claims):
+    def _check_iat(self, claim, limit, leeway):
+        # an issued-at time in the future is not acceptable; the same
+        # leeway as for 'nbf' is applied to allow clock skew
+        if claim > limit + leeway:
+            raise JWTNotYetValid(
+                'Issued at %s, time: %s(leeway: %s)' % (
+                    claim, limit, leeway))
+
+    def _check_max_token_age(self, claims, max_age):
+        # The maximum lifetime is a hard structural check, the leeway
+        # does not apply to it: the token's own 'exp' - 'iat' span must
+        # fit within max_age regardless of the current time.
+        if 'iat' not in claims or claims['iat'] is None:
+            raise JWTMissingClaim(
+                "Claim iat is required when max_token_age is enabled")
+        if 'exp' not in claims or claims['exp'] is None:
+            raise JWTMissingClaim(
+                "Claim exp is required when max_token_age is enabled")
+        iat = claims['iat']
+        exp = claims['exp']
+        if exp < iat:
+            raise JWTInvalidClaimValue(
+                "Claim exp (%s) must not precede iat (%s)" % (exp, iat))
+        lifetime = exp - iat
+        if lifetime > max_age:
+            raise JWTExpired(
+                'Token lifetime %s exceeds max_token_age %s' % (
+                    lifetime, max_age))
+
+    def _resolve_now(self, now):
+        # Single place where the verification time is captured: a whole
+        # validation uses one and the same value for exp, nbf and iat.
+        if now is _UNSET:
+            now = self._now
+        if now is None:
+            return time.time()
+        return _validate_numericdate(now, 'now')
+
+    def _check_default_claims(self, claims, now):
         self._check_string_claim('iss', claims)
         self._check_string_claim('sub', claims)
         self._check_array_or_string_claim('aud', claims)
-        self._check_integer_claim('exp', claims)
-        self._check_integer_claim('nbf', claims)
-        self._check_integer_claim('iat', claims)
+        self._check_numericdate_claim('exp', claims)
+        self._check_numericdate_claim('nbf', claims)
+        self._check_numericdate_claim('iat', claims)
         self._check_string_claim('jti', claims)
         self._check_string_claim('typ', claims)
 
+        if 'iat' in claims:
+            self._check_iat(claims['iat'], now, self._leeway)
+
+        if self._max_token_age is not None:
+            self._check_max_token_age(claims, self._max_token_age)
+
         if self._check_claims is None:
             if 'exp' in claims:
-                self._check_exp(claims['exp'], time.time(), self._leeway)
+                self._check_exp(claims['exp'], now, self._leeway)
             if 'nbf' in claims:
-                self._check_nbf(claims['nbf'], time.time(), self._leeway)
+                self._check_nbf(claims['nbf'], now, self._leeway)
 
     def _check_check_claims(self, check_claims):
         self._check_string_claim('iss', check_claims)
         self._check_string_claim('sub', check_claims)
         self._check_array_or_string_claim('aud', check_claims)
         self._check_string_claim('scope', check_claims)
-        self._check_integer_claim('exp', check_claims)
-        self._check_integer_claim('nbf', check_claims)
-        self._check_integer_claim('iat', check_claims)
+        self._check_numericdate_claim('exp', check_claims)
+        self._check_numericdate_claim('nbf', check_claims)
+        self._check_numericdate_claim('iat', check_claims)
         self._check_string_claim('jti', check_claims)
         self._check_string_claim('typ', check_claims)
 
-    def _check_provided_claims(self, payload):
+    def _check_provided_claims(self, payload, now):
         try:
             if isinstance(payload, dict):
                 claims = copy.deepcopy(payload)
@@ -520,7 +647,7 @@ class JWT:
                 raise JWTInvalidClaimFormat(
                     "Invalid Claim format for %s" % (k, ))
 
-        self._check_default_claims(claims)
+        self._check_default_claims(claims, now)
 
         if self._check_claims is None:
             return json_encode(claims)
@@ -555,13 +682,13 @@ class JWT:
                 if value is not None:
                     self._check_exp(claims[name], value, 0)
                 else:
-                    self._check_exp(claims[name], time.time(), self._leeway)
+                    self._check_exp(claims[name], now, self._leeway)
 
             elif name == 'nbf':
                 if value is not None:
                     self._check_nbf(claims[name], value, 0)
                 else:
-                    self._check_nbf(claims[name], time.time(), self._leeway)
+                    self._check_nbf(claims[name], now, self._leeway)
 
             elif name == 'typ':
                 if value is not None:
@@ -640,16 +767,48 @@ class JWT:
         self.token = t
         self._expected_type = "JWE"
 
-    def validate(self, key):
+    def validate(self, key, now=_UNSET, max_token_age=_UNSET):
         """Validate a JWT token that was deserialized w/o providing a key
+
+        The cryptographic validation (signature verification or
+        decryption) is always performed before the claims checks. If any
+        check fails, any claims previously stored on this object are
+        cleared, so a rejected token never leaves accessible claims.
 
         :param key: A (:class:`jwcrypto.jwk.JWK`) verification or
          decryption key, or a (:class:`jwcrypto.jwk.JWKSet`) that
          contains a key indexed by the 'kid' header.
+        :param now: An optional NumericDate (int or finite float) used
+         as the single verification time for the 'exp', 'nbf' and 'iat'
+         claims. When omitted the value set on the object is used, and
+         if that is also unset the current system time is captured once
+         for the whole validation.
+        :param max_token_age: An optional non-negative NumericDate that
+         enables and sets the hard cap on the token lifetime
+         ('exp' - 'iat'). When omitted the value set on the object is
+         used; pass None to explicitly disable the check for this call.
         """
         self.deserializelog = []
         if self.token is None:
             raise ValueError("Token empty")
+
+        # Resolve the time-based parameters before any check so that the
+        # whole validation uses a single, reproducible point in time.
+        # An explicit per-call None for max_token_age disables the cap
+        # that may have been configured on the object for this call.
+        if now is not _UNSET:
+            self.now = None if now is None else _validate_numericdate(
+                now, 'now')
+        if max_token_age is not _UNSET:
+            if max_token_age is None:
+                self._max_token_age = None
+            else:
+                self.max_token_age = max_token_age
+        now = self._resolve_now(_UNSET)
+
+        # A failed validation must not leave previously parsed claims
+        # accessible; drop them until the new token fully validates.
+        self._claims = None
 
         et = self._expected_type_heuristics(key)
         validate_fn = None
@@ -683,7 +842,7 @@ class JWT:
         payload = self.token.payload
         if isinstance(payload, bytes):
             payload = payload.decode('utf-8')
-        self._claims = self._check_provided_claims(payload)
+        self._claims = self._check_provided_claims(payload, now)
 
     @staticmethod
     def _is_json_serialization(jwt):
@@ -697,16 +856,28 @@ class JWT:
         except ValueError:
             return False
 
-    def deserialize(self, jwt, key=None):
+    def deserialize(self, jwt, key=None, now=_UNSET,
+                    max_token_age=_UNSET):
         """Deserialize a JWT token.
 
         NOTE: Destroys any current status and tries to import the raw
-        token provided.
+        token provided. Any previously stored claims are cleared before
+        validation, so a rejected token leaves no accessible claims on
+        this object.
 
         :param jwt: a 'raw' JWT token.
         :param key: A (:class:`jwcrypto.jwk.JWK`) verification or
          decryption key, or a (:class:`jwcrypto.jwk.JWKSet`) that
          contains a key indexed by the 'kid' header.
+        :param now: An optional NumericDate (int or finite float) used
+         as the single verification time for the 'exp', 'nbf' and 'iat'
+         claims. When omitted the value set on the object is used, and
+         if that is also unset the current system time is captured once
+         for the whole validation.
+        :param max_token_age: An optional non-negative NumericDate that
+         enables and sets the hard cap on the token lifetime
+         ('exp' - 'iat'). When omitted the value set on the object is
+         used; pass None to explicitly disable the check for this call.
 
         :raises ValueError: if strict_serialization is enabled and the
          token is not in the JWS/JWE Compact Serialization (for example
@@ -729,12 +900,21 @@ class JWT:
         if self._algs:
             self.token.allowed_algs = self._algs
 
+        # Drop any claims from a previously validated token: a new
+        # deserialize starts from a clean state and failed validation
+        # must not leave stale claims accessible.
+        self._claims = None
         self.deserializelog = None
         # now deserialize and also decrypt/verify (or raise) if we
         # have a key
         self.token.deserialize(jwt, None)
         if key:
-            self.validate(key)
+            kwargs = {}
+            if now is not _UNSET:
+                kwargs['now'] = now
+            if max_token_age is not _UNSET:
+                kwargs['max_token_age'] = max_token_age
+            self.validate(key, **kwargs)
 
     def serialize(self, compact=True):
         """Serializes the object into a JWS token.
@@ -793,4 +973,6 @@ class JWT:
                f'jwt={jwt}, ' + \
                f'key=None, algs={self._algs}, ' + \
                f'default_claims={self._reg_claims}, ' + \
-               f'check_claims={self._check_claims})'
+               f'check_claims={self._check_claims}, ' + \
+               f'now={self._now}, ' + \
+               f'max_token_age={self._max_token_age})'
