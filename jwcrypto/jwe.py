@@ -60,6 +60,69 @@ InvalidJWEKeyType = common.InvalidJWEKeyType
 InvalidJWEOperation = common.InvalidJWEOperation
 
 
+class JWEPolicy:
+    """Receiver policy for authenticated JWE headers.
+
+    A policy lets a receiver state *where* business headers must live and
+    *which* algorithm combinations are acceptable, instead of relying on the
+    merged header view where it is no longer possible to tell whether a
+    parameter was authenticated (protected header) or not.
+
+    :param required_protected: An optional iterable of header parameter names
+     that must be present in the protected header of the recipient being
+     decrypted. A parameter present only in the shared unprotected header or
+     in the per-recipient unprotected header is rejected, and so is a
+     parameter duplicated across header layers.
+    :param allowed_algs: An optional iterable of acceptable key management
+     algorithm names (the 'alg' header). If unset the algorithm allow list
+     configured on the JWE object applies.
+    :param allowed_encs: An optional iterable of acceptable content encryption
+     algorithm names (the 'enc' header). If unset any supported 'enc' value
+     is accepted.
+    :param allowed_combos: An optional iterable of ``(alg, enc)`` tuples; when
+     provided only these exact combinations are accepted.
+    """
+
+    def __init__(self, required_protected=None, allowed_algs=None,
+                 allowed_encs=None, allowed_combos=None):
+        self.required_protected = tuple(required_protected or ())
+        self.allowed_algs = tuple(allowed_algs) if allowed_algs else None
+        self.allowed_encs = tuple(allowed_encs) if allowed_encs else None
+        if allowed_combos is not None:
+            self.allowed_combos = tuple((alg, enc) for alg, enc
+                                        in allowed_combos)
+        else:
+            self.allowed_combos = None
+
+    def check(self, protected, unprotected, recipient, merged):
+        """Validate the headers of one recipient attempt.
+
+        The three layer dictionaries are kept separate so the origin of every
+        parameter is preserved; ``merged`` is the union used for decryption.
+
+        :raises InvalidJWEData: if the policy is not satisfied.
+        """
+        for name in self.required_protected:
+            if name not in protected:
+                raise InvalidJWEData(
+                    'Header "%s" must be in the protected header' % name)
+
+        alg = merged.get('alg')
+        enc = merged.get('enc')
+
+        if self.allowed_algs is not None and alg not in self.allowed_algs:
+            raise InvalidJWEData('Algorithm "alg"="%s" not allowed by '
+                                 'policy' % alg)
+        if self.allowed_encs is not None and enc not in self.allowed_encs:
+            raise InvalidJWEData('Algorithm "enc"="%s" not allowed by '
+                                 'policy' % enc)
+        if self.allowed_combos is not None and \
+                (alg, enc) not in self.allowed_combos:
+            raise InvalidJWEData(
+                'Algorithm combination ("%s", "%s") not allowed by '
+                'policy' % (alg, enc))
+
+
 class JWE:
     """JSON Web Encryption object
 
@@ -68,7 +131,7 @@ class JWE:
 
     def __init__(self, plaintext=None, protected=None, unprotected=None,
                  aad=None, algs=None, recipient=None, header=None,
-                 header_registry=None, flattened=True):
+                 header_registry=None, flattened=True, policy=None):
         """Creates a JWE token.
 
         :param plaintext(bytes): An arbitrary plaintext to be encrypted.
@@ -80,12 +143,16 @@ class JWE:
         :param header: An optional header for the default recipient
         :param header_registry: Optional additions to the header registry
         :param flattened: Use flattened serialization syntax (default True)
+        :param policy: An optional :class:`JWEPolicy` enforced when
+         decrypting, restricting which headers must be protected and which
+         algorithm combinations are accepted.
         """
         self._allowed_algs = None
         self.objects = {}
         self.plaintext = None
         self.header_registry = JWSEHeaderRegistry(JWEHeaderRegistry)
         self.flattened = flattened
+        self.policy = policy
         if header_registry:
             self.header_registry.update(header_registry)
         if plaintext is not None:
@@ -95,6 +162,7 @@ class JWE:
                 self.plaintext = plaintext.encode('utf-8')
         self.cek = None
         self.decryptlog = None
+        self.header_layers = None
         if aad:
             self.objects['aad'] = aad
         if protected:
@@ -170,6 +238,33 @@ class JWE:
                 rh = json_decode(header)
             jh = self._merge_headers(jh, rh)
         return jh
+
+    def _get_header_layers(self, header=None):
+        """Return the three header layers and their merged view.
+
+        The layers are returned separately so policy checks can observe the
+        origin (protected, shared unprotected, per-recipient unprotected) of
+        each parameter. Merging still runs through `_merge_headers`, so
+        parameters duplicated across layers are rejected.
+        """
+        protected = {}
+        unprotected = {}
+        recipient_header = {}
+        if 'protected' in self.objects:
+            protected = json_decode(self.objects['protected'])
+        if 'unprotected' in self.objects:
+            unprotected = json_decode(self.objects['unprotected'])
+        if header:
+            if isinstance(header, dict):
+                recipient_header = dict(header)
+            else:
+                recipient_header = json_decode(header)
+
+        merged = {}
+        self._merge_headers(merged, protected)
+        self._merge_headers(merged, unprotected)
+        self._merge_headers(merged, recipient_header)
+        return protected, unprotected, recipient_header, merged
 
     def _get_alg_enc_from_headers(self, jh):
         algname = jh.get('alg', None)
@@ -367,7 +462,13 @@ class JWE:
     # FIXME: allow to specify which algorithms to accept as valid
     def _decrypt(self, key, ppe, max_plaintext=default_max_plaintext_size):
 
-        jh = self._get_jose_header(ppe.get('header', None))
+        protected, unprotected, recipient_header, jh = \
+            self._get_header_layers(ppe.get('header', None))
+        # Expose the separate header layers so custom header check functions
+        # can tell which layer a parameter originated from.
+        self.header_layers = {'protected': protected,
+                              'unprotected': unprotected,
+                              'recipient': recipient_header}
 
         # TODO: allow caller to specify list of headers it understands
         self._check_crit(jh.get('crit', {}))
@@ -376,6 +477,10 @@ class JWE:
             if hdr in self.header_registry:
                 if not self.header_registry.check_header(hdr, self):
                     raise InvalidJWEData('Failed header check')
+
+        if self.policy is not None:
+            self.policy.check(protected, unprotected,
+                              recipient_header, jh)
 
         alg = self._jwa_keymgmt(jh.get('alg', None))
         enc = self._jwa_enc(jh.get('enc', None))
@@ -435,7 +540,7 @@ class JWE:
         else:
             raise ValueError('Unknown compression')
 
-    def decrypt(self, key, max_plaintext=0):
+    def decrypt(self, key, max_plaintext=0, policy=None):
         """Decrypt a JWE token.
 
         :param key: The (:class:`jwcrypto.jwk.JWK`) decryption key.
@@ -446,20 +551,26 @@ class JWE:
          the library default applies. Application writers are recommended
          to set a limit here if they know what is the max plaintext size
          for their application.
+        :param policy: An optional :class:`JWEPolicy` overriding any policy
+         set on this object for this decryption attempt. The policy is
+         applied to each recipient actually attempted.
 
         :raises InvalidJWEOperation: if the key is not a JWK object.
         :raises InvalidJWEData: if the ciphertext can't be decrypted or
-         the object is otherwise malformed.
+         the object is otherwise malformed, including policy violations.
         :raises JWKeyNotFound: if key is a JWKSet and the key is not found.
         """
 
         self.plaintext = None
         if max_plaintext == 0:
             max_plaintext = default_max_plaintext_size
+        if policy is not None:
+            self.policy = policy
 
         if 'ciphertext' not in self.objects:
             raise InvalidJWEOperation("No available ciphertext")
         self.decryptlog = []
+        self.header_layers = None
         missingkey = False
 
         if 'recipients' in self.objects:
@@ -491,7 +602,7 @@ class JWE:
             raise InvalidJWEData('No recipient matched the provided '
                                  'key' + repr(self.decryptlog))
 
-    def deserialize(self, raw_jwe, key=None):
+    def deserialize(self, raw_jwe, key=None, policy=None):
         """Deserialize a JWE token.
 
         NOTE: Destroys any current status and tries to import the raw
@@ -506,6 +617,9 @@ class JWE:
          or a (:class:`jwcrypto.jwk.JWKSet`) that contains a key indexed
          by the 'kid' header or (deprecated) a string containing a password
          (optional).
+        :param policy: An optional :class:`JWEPolicy` enforced during the
+         decryption step, restricting protected headers and allowed
+         algorithm combinations (optional).
 
         :raises InvalidJWEData: if the raw object is an invalid JWE token.
         :raises InvalidJWEOperation: if the decryption fails.
@@ -514,6 +628,9 @@ class JWE:
         self.objects = {}
         self.plaintext = None
         self.cek = None
+        self.header_layers = None
+        if policy is not None:
+            self.policy = policy
 
         o = {}
         try:

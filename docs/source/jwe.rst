@@ -14,6 +14,10 @@ Classes
    :members:
    :show-inheritance:
 
+.. autoclass:: jwcrypto.jwe.JWEPolicy
+   :members:
+   :show-inheritance:
+
 Variables
 ---------
 
@@ -96,3 +100,38 @@ Decrypt a JWE token::
     >>> jwetoken = jwe.JWE()
     >>> jwetoken.deserialize(enc, key=private_key)
     >>> payload = jwetoken.payload
+
+Receiver policies
+~~~~~~~~~~~~~~~~~
+
+By default decryption merges the protected, shared unprotected and
+per-recipient unprotected headers, which makes it impossible to require that
+a business header was actually authenticated. A :class:`JWEPolicy` keeps the
+three header layers separate and rejects tokens that place required headers
+outside the protected header, duplicate a header across layers, or use an
+unaccepted ``alg``/``enc`` combination.
+
+Enforce protected headers and an algorithm combination when decrypting::
+
+    >>> from jwcrypto.jwe import JWEPolicy
+    >>> policy_key = jwk.JWK.generate(kty='oct', size=128)
+    >>> policy_token = jwe.JWE(
+    ...     b'policy protected message',
+    ...     protected={'alg': 'A128KW', 'enc': 'A128GCM',
+    ...                'partner': 'example-partner'})
+    >>> policy_token.add_recipient(policy_key)
+    >>> policy_enc = policy_token.serialize(compact=True)
+    >>> policy = JWEPolicy(
+    ...     required_protected=['partner'],
+    ...     allowed_combos=[('A128KW', 'A128GCM')])
+    >>> policy_jwe = jwe.JWE()
+    >>> policy_jwe.deserialize(policy_enc, key=policy_key, policy=policy)
+    >>> policy_jwe.payload
+    b'policy protected message'
+
+The same policy can be attached to the object and is applied to every
+recipient actually attempted when using the JSON serialization; a recipient
+cannot satisfy the requirements using another recipient's headers. The
+compact serialization already places all headers in the protected layer, but
+its algorithms are still checked against the combination policy. When no
+policy is provided the historical, permissive behavior is unchanged.

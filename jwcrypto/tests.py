@@ -1814,6 +1814,287 @@ class TestJWE(unittest.TestCase):
         b.decrypt(key_pbes)
         self.assertEqual(b.payload, payload)
 
+    def test_policy_header_placement_accepted_vs_rejected(self):
+        # Two legal JWEs carrying the same plaintext and the same business
+        # header 'partner', only placed in different header layers.
+        key = jwk.JWK.generate(kty='oct', size=128)
+        payload = b'partner-agreement-v1'
+
+        protected_token = jwe.JWE(
+            payload,
+            protected={'alg': 'A128KW', 'enc': 'A128GCM',
+                       'partner': 'acme'})
+        protected_token.add_recipient(key)
+        compact = protected_token.serialize(compact=True)
+
+        unprotected_token = jwe.JWE(
+            payload,
+            protected={'alg': 'A128KW', 'enc': 'A128GCM'},
+            flattened=False)
+        unprotected_token.add_recipient(
+            key, header={'kid': 'key-1', 'partner': 'acme'})
+        json_token = unprotected_token.serialize()
+
+        policy = jwe.JWEPolicy(
+            required_protected=['partner'],
+            allowed_combos=[('A128KW', 'A128GCM')])
+
+        # Protected placement satisfies the policy.
+        ok = jwe.JWE()
+        ok.deserialize(compact, key, policy=policy)
+        self.assertEqual(ok.payload, payload)
+        self.assertIn('partner', ok.header_layers['protected'])
+        self.assertNotIn('partner', ok.header_layers['recipient'])
+
+        # The same payload with the header in the per-recipient
+        # unprotected layer is rejected: a merged view would only see
+        # that the field 'exists'.
+        bad = jwe.JWE()
+        with self.assertRaisesRegex(jwe.InvalidJWEData,
+                                    'must be in the protected header'):
+            bad.deserialize(json_token, key, policy=policy)
+        self.assertIsNone(bad.plaintext)
+
+        # Without a policy the second token still decrypts, preserving
+        # the backwards compatible behavior.
+        legacy = jwe.JWE()
+        legacy.deserialize(json_token, key)
+        self.assertEqual(legacy.payload, payload)
+
+    def test_policy_constructor_and_method_equivalence(self):
+        key = jwk.JWK.generate(kty='oct', size=128)
+        payload = b'ctor-policy'
+        enc = jwe.JWE(payload,
+                      protected={'alg': 'A128KW', 'enc': 'A128GCM',
+                                 'partner': 'acme'})
+        enc.add_recipient(key)
+        token = enc.serialize(compact=True)
+
+        policy = jwe.JWEPolicy(required_protected=['partner'])
+
+        ctor = jwe.JWE(policy=policy)
+        ctor.deserialize(token, key)
+        self.assertEqual(ctor.payload, payload)
+
+        method = jwe.JWE()
+        method.deserialize(token)
+        method.decrypt(key, policy=policy)
+        self.assertEqual(method.payload, payload)
+
+    def test_policy_alg_enc_combination(self):
+        key = jwk.JWK.generate(kty='oct', size=128)
+        payload = b'combo'
+        enc = jwe.JWE(payload,
+                      protected={'alg': 'A128KW', 'enc': 'A128GCM'})
+        enc.add_recipient(key)
+        token = enc.serialize(compact=True)
+
+        # Compact tokens already keep alg/enc protected, but still have to
+        # satisfy the combination policy.
+        good = jwe.JWE()
+        good.deserialize(token, key, policy=jwe.JWEPolicy(
+            allowed_combos=[('A128KW', 'A128GCM')]))
+        self.assertEqual(good.payload, payload)
+
+        with self.assertRaisesRegex(jwe.InvalidJWEData,
+                                    'not allowed by policy'):
+            jwe.JWE().deserialize(token, key, policy=jwe.JWEPolicy(
+                allowed_combos=[('A256KW', 'A128GCM')]))
+
+        # Individual alg/enc allow lists are supported too.
+        only_alg = jwe.JWE()
+        only_alg.deserialize(token, key,
+                             policy=jwe.JWEPolicy(allowed_algs=['A128KW']))
+        self.assertEqual(only_alg.payload, payload)
+
+        with self.assertRaisesRegex(jwe.InvalidJWEData,
+                                    '"alg".*not allowed by policy'):
+            jwe.JWE().deserialize(token, key,
+                                  policy=jwe.JWEPolicy(
+                                      allowed_algs=['RSA-OAEP']))
+
+        only_enc = jwe.JWE()
+        only_enc.deserialize(token, key,
+                             policy=jwe.JWEPolicy(
+                                 allowed_encs=['A128GCM']))
+        self.assertEqual(only_enc.payload, payload)
+
+        with self.assertRaisesRegex(jwe.InvalidJWEData,
+                                    '"enc".*not allowed by policy'):
+            jwe.JWE().deserialize(token, key,
+                                  policy=jwe.JWEPolicy(
+                                      allowed_encs=['A256GCM']))
+
+    def test_policy_shared_unprotected_placement_rejected(self):
+        key = jwk.JWK.generate(kty='oct', size=128)
+        payload = b'shared-layer'
+        enc = jwe.JWE(
+            payload,
+            protected={'alg': 'A128KW', 'enc': 'A128GCM'},
+            unprotected={'partner': 'acme'},
+            flattened=False)
+        enc.add_recipient(key)
+        token = enc.serialize()
+
+        with self.assertRaisesRegex(jwe.InvalidJWEData,
+                                    'must be in the protected header'):
+            jwe.JWE().deserialize(
+                token, key,
+                policy=jwe.JWEPolicy(required_protected=['partner']))
+
+    def test_policy_duplicate_header_across_layers(self):
+        # A parameter present in both the protected and an unprotected
+        # layer must be rejected instead of silently merged.
+        key = jwk.JWK.generate(kty='oct', size=128)
+        enc = jwe.JWE(b'dup',
+                      protected={'alg': 'A128KW', 'enc': 'A128GCM',
+                                 'partner': 'acme'},
+                      flattened=False)
+        enc.add_recipient(key, header={'kid': 'k1'})
+        token = json_decode(enc.serialize())
+        # Re-encode the protected header so 'partner' also appears in the
+        # per-recipient unprotected header.
+        token['recipients'][0]['header']['partner'] = 'acme'
+
+        with self.assertRaisesRegex(jwe.InvalidJWEData,
+                                    'Duplicate header: "partner"'):
+            jwe.JWE().deserialize(
+                json_encode(token), key,
+                policy=jwe.JWEPolicy(required_protected=['partner']))
+
+    def test_policy_multiple_recipients_isolation(self):
+        payload = b'multi-recipient-policy'
+        key1 = jwk.JWK.generate(kty='oct', size=128, kid='key1')
+        key2 = jwk.JWK.generate(kty='oct', size=256, kid='key2')
+
+        enc = jwe.JWE(
+            payload,
+            protected={'enc': 'A128GCM', 'partner': 'acme'},
+            flattened=False)
+        enc.add_recipient(key1, header={'alg': 'A128KW', 'kid': 'key1'})
+        enc.add_recipient(key2, header={'alg': 'A256KW', 'kid': 'key2'})
+        token = enc.serialize()
+
+        policy = jwe.JWEPolicy(
+            required_protected=['partner'],
+            allowed_combos=[('A128KW', 'A128GCM')])
+
+        # key2 matches the second recipient; its A256KW/A128GCM combination
+        # is disallowed and the first recipient's headers cannot satisfy it.
+        with self.assertRaisesRegex(jwe.InvalidJWEData,
+                                    'not allowed by policy'):
+            jwe.JWE().deserialize(token, key2, policy=policy)
+
+        # The first recipient uses the allowed combination.
+        ok = jwe.JWE()
+        ok.deserialize(token, key1, policy=policy)
+        self.assertEqual(ok.payload, payload)
+
+        # A key set matching no recipient still reports JWKeyNotFound when
+        # the policy itself is satisfiable, instead of a policy violation.
+        foreign = jwk.JWK.generate(kty='oct', size=128, kid='foreign')
+        foreign_set = jwk.JWKSet()
+        foreign_set.add(foreign)
+        with self.assertRaises(JWKeyNotFound):
+            jwe.JWE().deserialize(
+                token, foreign_set,
+                policy=jwe.JWEPolicy(
+                    required_protected=['partner'],
+                    allowed_algs=['A128KW', 'A256KW']))
+
+    def test_policy_with_aad(self):
+        key = jwk.JWK.generate(kty='oct', size=128)
+        payload = b'aad-payload'
+        enc = jwe.JWE(
+            payload,
+            protected={'alg': 'A128KW', 'enc': 'A128GCM',
+                       'partner': 'acme'},
+            aad=b'binding-data')
+        enc.add_recipient(key)
+        token = enc.serialize()
+
+        ok = jwe.JWE()
+        ok.deserialize(
+            token, key,
+            policy=jwe.JWEPolicy(required_protected=['partner']))
+        self.assertEqual(ok.payload, payload)
+        self.assertEqual(ok.objects['aad'], b'binding-data')
+
+    def test_policy_unknown_critical_header_still_rejected(self):
+        # The existing 'crit' handling must keep working alongside policy.
+        key = jwk.JWK.generate(kty='oct', size=128)
+        enc = jwe.JWE(
+            b'crit',
+            protected={'alg': 'A128KW', 'enc': 'A128GCM',
+                       'partner': 'acme'})
+        enc.add_recipient(key)
+        parts = enc.serialize(compact=True).split('.')
+        protected = json_decode(base64url_decode(parts[0]))
+        protected['crit'] = ['unknown-critical']
+        protected['unknown-critical'] = 'value'
+        parts[0] = base64url_encode(json_encode(protected))
+        raw = '.'.join(parts)
+
+        with self.assertRaisesRegex(jwe.InvalidJWEData,
+                                    'Unknown critical header'):
+            jwe.JWE().deserialize(
+                raw, key,
+                policy=jwe.JWEPolicy(required_protected=['partner']))
+
+    def test_policy_custom_header_check_sees_source(self):
+        key = jwk.JWK.generate(kty='oct', size=128)
+
+        def must_be_protected(jwobj):
+            return 'partner' in jwobj.header_layers['protected']
+
+        registry = {'partner': JWSEHeaderParameter(
+            'Partner id', False, True, must_be_protected)}
+
+        protected_token = jwe.JWE(
+            b'custom',
+            protected={'alg': 'A128KW', 'enc': 'A128GCM',
+                       'partner': 'acme'},
+            header_registry=registry)
+        protected_token.add_recipient(key)
+        ok = jwe.JWE(header_registry=registry)
+        ok.deserialize(protected_token.serialize(compact=True), key)
+        self.assertEqual(ok.payload, b'custom')
+
+        unprotected_token = jwe.JWE(
+            b'custom',
+            protected={'alg': 'A128KW', 'enc': 'A128GCM'},
+            flattened=False, header_registry=registry)
+        unprotected_token.add_recipient(key, header={'partner': 'acme'})
+        with self.assertRaisesRegex(jwe.InvalidJWEData,
+                                    'Failed header check'):
+            jwe.JWE(header_registry=registry).deserialize(
+                unprotected_token.serialize(), key)
+
+    def test_policy_object_reuse_clears_plaintext(self):
+        key = jwk.JWK.generate(kty='oct', size=128)
+        other = jwk.JWK.generate(kty='oct', size=256)
+        payload = b'reuse-me'
+        enc = jwe.JWE(
+            payload,
+            protected={'alg': 'A128KW', 'enc': 'A128GCM',
+                       'partner': 'acme'})
+        enc.add_recipient(key)
+        token = enc.serialize(compact=True)
+
+        reused = jwe.JWE()
+        reused.deserialize(token, key)
+        self.assertEqual(reused.payload, payload)
+
+        # A later policy-enforced failure must not expose the plaintext from
+        # the previous successful decryption on the same object.
+        with self.assertRaises(jwe.InvalidJWEData):
+            reused.decrypt(other, policy=jwe.JWEPolicy(
+                required_protected=['partner']))
+        self.assertIsNone(reused.plaintext)
+        with self.assertRaises(jwe.InvalidJWEOperation):
+            reused.payload
+
+
 
 MMA_vector_key = jwk.JWK(**E_A2_key)
 MMA_vector_ok_cek =  \
