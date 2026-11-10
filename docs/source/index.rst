@@ -23,6 +23,7 @@ JWCrypto uses the Cryptography_ package for all the crypto functions.
    jws
    jwe
    jwt
+   nested
    common
 
 .. toctree::
