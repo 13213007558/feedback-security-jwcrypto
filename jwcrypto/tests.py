@@ -2704,6 +2704,302 @@ class TestUnencodedPayload(unittest.TestCase):
                             protected=rfc7797_u_header)
 
 
+class SmallChunkIterator:
+    """Yields the payload in small chunks only.
+
+    Any attempt to read the whole payload at once raises, so tests can
+    prove the verifier never buffers the entire stream.
+    """
+
+    def __init__(self, payload, chunk_size=7):
+        self._payload = payload
+        self._chunk_size = chunk_size
+        self.max_chunk_seen = 0
+        self.passes = 0
+
+    def __iter__(self):
+        self.passes += 1
+        for i in range(0, len(self._payload), self._chunk_size):
+            chunk = self._payload[i:i + self._chunk_size]
+            self.max_chunk_seen = max(self.max_chunk_seen, len(chunk))
+            yield chunk
+
+    def read(self, size=-1):
+        raise AssertionError('bulk reads are not allowed')
+
+    def readall(self):
+        raise AssertionError('bulk reads are not allowed')
+
+    def tobytes(self):
+        raise AssertionError('bulk reads are not allowed')
+
+
+class TestJWSStreamVerifier(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.rsa_key = jwk.JWK.generate(kty='RSA', size=2048)
+        cls.ec_key = jwk.JWK.generate(kty='EC', crv='P-256')
+
+    def _sign(self, key, alg, payload, protected=None):
+        t = jws.JWS(payload)
+        t.add_signature(key, None, protected or json_encode({"alg": alg}),
+                        None)
+        protected_b64, _, signature_b64 = \
+            t.serialize(compact=True).split('.')
+        return protected_b64, signature_b64
+
+    def _sign_unencoded(self, key, alg, payload):
+        # b64=False payloads may contain '.', so compact serialization
+        # is not an option; use the JSON serialization instead
+        t = jws.JWS(payload)
+        t.add_signature(key, None,
+                        json_encode({"alg": alg, "b64": False,
+                                     "crit": ["b64"]}), None)
+        o = json_decode(t.serialize())
+        return o['protected'], o['signature']
+
+    def _verify_inmemory(self, key, protected_b64, signature_b64, payload):
+        token = '.'.join([protected_b64, '', signature_b64])
+        t = jws.JWS()
+        t.deserialize(token)
+        t.verify(key, detached_payload=payload)
+        self.assertTrue(t.is_valid)
+
+    def test_stream_matches_inmemory_rsa(self):
+        payload = b'stream me' * 100
+        protected_b64, signature_b64 = self._sign(
+            self.rsa_key, 'RS256', payload)
+        v = jws.JWSStreamVerifier()
+        v.add_signature(self.rsa_key, signature_b64,
+                        protected=protected_b64)
+        self.assertTrue(v.verify(SmallChunkIterator(payload)))
+        self.assertTrue(v.is_valid)
+        # same conclusion with the in-memory interface
+        self._verify_inmemory(self.rsa_key, protected_b64, signature_b64,
+                              payload)
+
+    def test_stream_matches_inmemory_ec(self):
+        payload = b'stream me' * 100
+        protected_b64, signature_b64 = self._sign(
+            self.ec_key, 'ES256', payload)
+        v = jws.JWSStreamVerifier()
+        v.add_signature(self.ec_key, signature_b64, protected=protected_b64)
+        self.assertTrue(v.verify(SmallChunkIterator(payload, chunk_size=1)))
+        self._verify_inmemory(self.ec_key, protected_b64, signature_b64,
+                              payload)
+
+    def test_all_chunk_boundaries(self):
+        # short payload, try every possible split point
+        payload = b'{"sub":"1234567890"}'
+        protected_b64, signature_b64 = self._sign(
+            self.rsa_key, 'RS256', payload)
+        for cut in range(len(payload) + 1):
+            v = jws.JWSStreamVerifier()
+            v.add_signature(self.rsa_key, signature_b64,
+                            protected=protected_b64)
+            self.assertTrue(v.verify([payload[:cut], payload[cut:]]),
+                            'failed at cut %d' % cut)
+            self.assertTrue(v.is_valid)
+
+    def test_all_chunk_sizes(self):
+        payload = bytes(range(256)) * 2
+        protected_b64, signature_b64 = self._sign(
+            self.ec_key, 'ES256', payload)
+        for size in range(1, 12):
+            chunks = [payload[i:i + size]
+                      for i in range(0, len(payload), size)]
+            v = jws.JWSStreamVerifier()
+            v.add_signature(self.ec_key, signature_b64,
+                            protected=protected_b64)
+            self.assertTrue(v.verify(chunks),
+                            'failed with chunk size %d' % size)
+
+    def test_small_chunks_only(self):
+        payload = b'x' * 100000
+        protected_b64, signature_b64 = self._sign(
+            self.rsa_key, 'RS256', payload)
+        stream = SmallChunkIterator(payload, chunk_size=7)
+        v = jws.JWSStreamVerifier()
+        v.add_signature(self.rsa_key, signature_b64,
+                        protected=protected_b64)
+        self.assertTrue(v.verify(stream))
+        self.assertLessEqual(stream.max_chunk_seen, 7)
+
+    def test_tampered_payload_rejected(self):
+        payload = bytearray(b'sensitive data' * 10)
+        protected_b64, signature_b64 = self._sign(
+            self.rsa_key, 'RS256', bytes(payload))
+        # flip a single byte in the payload
+        payload[5] ^= 0x01
+        v = jws.JWSStreamVerifier()
+        v.add_signature(self.rsa_key, signature_b64,
+                        protected=protected_b64)
+        with self.assertRaises(jws.InvalidJWSSignature):
+            v.verify([bytes(payload)])
+        self.assertFalse(v.is_valid)
+        # the in-memory interface rejects it too
+        token = '.'.join([protected_b64, '', signature_b64])
+        t = jws.JWS()
+        t.deserialize(token)
+        with self.assertRaises(jws.InvalidJWSSignature):
+            t.verify(self.rsa_key, detached_payload=bytes(payload))
+
+    def test_empty_payload(self):
+        protected_b64, signature_b64 = self._sign(
+            self.rsa_key, 'RS256', b'')
+        for chunks in ([], [b''], [b'', b'']):
+            v = jws.JWSStreamVerifier()
+            v.add_signature(self.rsa_key, signature_b64,
+                            protected=protected_b64)
+            self.assertTrue(v.verify(iter(chunks)))
+            self.assertTrue(v.is_valid)
+
+    def test_b64_false(self):
+        payload = "$.02 unencoded payload"
+        protected_b64, signature_b64 = self._sign_unencoded(
+            self.rsa_key, 'RS256', payload)
+        raw = payload.encode('utf-8')
+        v = jws.JWSStreamVerifier()
+        v.add_signature(self.rsa_key, signature_b64,
+                        protected=protected_b64)
+        self.assertTrue(v.verify(SmallChunkIterator(raw, chunk_size=3)))
+        # same conclusion with the in-memory interface
+        self._verify_inmemory(self.rsa_key, protected_b64, signature_b64,
+                              payload)
+
+    def test_b64_false_tampered(self):
+        payload = "$.02 unencoded payload"
+        protected_b64, signature_b64 = self._sign_unencoded(
+            self.rsa_key, 'RS256', payload)
+        v = jws.JWSStreamVerifier()
+        v.add_signature(self.rsa_key, signature_b64,
+                        protected=protected_b64)
+        with self.assertRaises(jws.InvalidJWSSignature):
+            v.verify([b'$.03 unencoded payload'])
+        self.assertFalse(v.is_valid)
+
+    def test_unsupported_algs_rejected(self):
+        payload = b'data'
+        for key, alg in ((jwk.JWK.generate(kty='oct', size=256), 'HS256'),
+                         (jwk.JWK.generate(kty='OKP', crv='Ed25519'),
+                          'EdDSA')):
+            protected_b64, signature_b64 = self._sign(key, alg, payload)
+            v = jws.JWSStreamVerifier()
+            with self.assertRaises(jws.InvalidJWSOperation):
+                v.add_signature(key, signature_b64,
+                                protected=protected_b64)
+            self.assertFalse(v.is_valid)
+
+    def test_alg_not_allowed_rejected(self):
+        protected_b64, signature_b64 = self._sign(
+            self.rsa_key, 'RS256', b'data')
+        v = jws.JWSStreamVerifier(allowed_algs=['ES256'])
+        with self.assertRaises(jws.InvalidJWSOperation):
+            v.add_signature(self.rsa_key, signature_b64,
+                            protected=protected_b64)
+
+    def test_multiple_signatures_single_pass(self):
+        payload = b'shared payload' * 50
+        p1, s1 = self._sign(self.rsa_key, 'RS256', payload)
+        p2, s2 = self._sign(self.ec_key, 'ES256', payload)
+        v = jws.JWSStreamVerifier()
+        v.add_signature(self.rsa_key, s1, protected=p1)
+        v.add_signature(self.ec_key, s2, protected=p2)
+        stream = SmallChunkIterator(payload, chunk_size=11)
+        self.assertTrue(v.verify(stream))
+        self.assertEqual(stream.passes, 1)
+        self.assertTrue(v.is_valid)
+
+    def test_one_failing_signature_invalidates_all(self):
+        payload = b'shared payload' * 50
+        p1, s1 = self._sign(self.rsa_key, 'RS256', payload)
+        p2, _ = self._sign(self.ec_key, 'ES256', payload)
+        # sign the same payload with a different EC key: verification
+        # of the second signature must fail
+        _, s2 = self._sign(jwk.JWK.generate(kty='EC', crv='P-256'),
+                           'ES256', payload)
+        v = jws.JWSStreamVerifier()
+        v.add_signature(self.rsa_key, s1, protected=p1)
+        v.add_signature(self.ec_key, s2, protected=p2)
+        with self.assertRaises(jws.InvalidJWSSignature):
+            v.verify([payload])
+        self.assertFalse(v.is_valid)
+
+    def test_max_payload_size(self):
+        payload = b'a' * 1000
+        protected_b64, signature_b64 = self._sign(
+            self.rsa_key, 'RS256', payload)
+        v = jws.JWSStreamVerifier(max_payload_size=999)
+        v.add_signature(self.rsa_key, signature_b64,
+                        protected=protected_b64)
+        with self.assertRaises(jws.InvalidJWSOperation):
+            v.verify(SmallChunkIterator(payload, chunk_size=100))
+        self.assertFalse(v.is_valid)
+        # exactly at the limit is accepted
+        v = jws.JWSStreamVerifier(max_payload_size=1000)
+        v.add_signature(self.rsa_key, signature_b64,
+                        protected=protected_b64)
+        self.assertTrue(v.verify(SmallChunkIterator(payload,
+                                                    chunk_size=100)))
+
+    def test_payload_read_failure(self):
+        payload = b'data' * 100
+        protected_b64, signature_b64 = self._sign(
+            self.rsa_key, 'RS256', payload)
+
+        def broken():
+            yield payload[:10]
+            raise IOError('read error')
+
+        v = jws.JWSStreamVerifier()
+        v.add_signature(self.rsa_key, signature_b64,
+                        protected=protected_b64)
+        with self.assertRaises(jws.InvalidJWSOperation):
+            v.verify(broken())
+        self.assertFalse(v.is_valid)
+
+    def test_no_signatures(self):
+        v = jws.JWSStreamVerifier()
+        with self.assertRaises(jws.InvalidJWSSignature):
+            v.verify([b'data'])
+        self.assertFalse(v.is_valid)
+
+    def test_protected_raw_encoding_preserved(self):
+        # non-canonical protected header: re-encoding it would produce
+        # different bytes and a different signing input
+        protected = '{"alg": "RS256"}'
+        payload = b'raw encoding matters'
+        core = jws.JWSCore('RS256', self.rsa_key, protected, payload)
+        sig = core.sign()
+        v = jws.JWSStreamVerifier()
+        v.add_signature(self.rsa_key, sig['signature'],
+                        protected=sig['protected'])
+        self.assertTrue(v.verify([payload]))
+        # passing the header as a dict re-encodes it canonically and
+        # must fail to verify against this signature
+        v = jws.JWSStreamVerifier()
+        v.add_signature(self.rsa_key, sig['signature'],
+                        protected={"alg": "RS256"})
+        with self.assertRaises(jws.InvalidJWSSignature):
+            v.verify([payload])
+        self.assertFalse(v.is_valid)
+
+    def test_crit_rules_enforced(self):
+        # unknown critical header must be rejected
+        protected = base64url_encode(
+            '{"alg":"RS256","crit":["unknown"],"unknown":true}')
+        v = jws.JWSStreamVerifier()
+        with self.assertRaises(jws.InvalidJWSObject):
+            v.add_signature(self.rsa_key, b'fakesig', protected=protected)
+        # b64 must be a boolean
+        protected = base64url_encode(
+            '{"alg":"RS256","b64":"yes","crit":["b64"]}')
+        v = jws.JWSStreamVerifier()
+        with self.assertRaises(jws.InvalidJWSObject):
+            v.add_signature(self.rsa_key, b'fakesig', protected=protected)
+
+
 class TestOverloadedOperators(unittest.TestCase):
 
     def test_jws_equality(self):

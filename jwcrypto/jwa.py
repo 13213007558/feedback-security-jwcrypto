@@ -140,11 +140,42 @@ def _decode_int(n):
 
 class _RawJWS:
 
+    supports_streaming = False
+
     def sign(self, key, payload):
         raise NotImplementedError
 
     def verify(self, key, payload, signature):
         raise NotImplementedError
+
+    def streaming_verifier(self, key, signature):
+        """Returns a verifier that accepts the signing input in chunks.
+
+        The returned object exposes an update(chunk) method and a
+        verify() method that raises an exception if the signature does
+        not match.
+        """
+        raise NotImplementedError(
+            'The %s algorithm does not support streaming verification'
+            % getattr(self, 'name', 'requested'))
+
+
+class _StreamingHashVerifier:
+    """Incrementally hashes the signing input, then verifies.
+
+    Used for algorithms whose signature is computed over the digest of
+    the message, so the message itself never needs to be buffered.
+    """
+
+    def __init__(self, hashfn, verify_digest):
+        self._ctx = hashes.Hash(hashfn, backend=default_backend())
+        self._verify_digest = verify_digest
+
+    def update(self, chunk):
+        self._ctx.update(chunk)
+
+    def verify(self):
+        self._verify_digest(self._ctx.finalize())
 
 
 class _RawHMAC(_RawJWS):
@@ -175,6 +206,8 @@ class _RawHMAC(_RawJWS):
 
 
 class _RawRSA(_RawJWS):
+    supports_streaming = True
+
     def __init__(self, padfn, hashfn):
         self.padfn = padfn
         self.hashfn = hashfn
@@ -187,8 +220,19 @@ class _RawRSA(_RawJWS):
         pkey = key.get_op_key('verify')
         pkey.verify(signature, payload, self.padfn, self.hashfn)
 
+    def streaming_verifier(self, key, signature):
+        pkey = key.get_op_key('verify')
+        prehashed = ec_utils.Prehashed(self.hashfn)
+
+        def verify_digest(digest):
+            pkey.verify(signature, digest, self.padfn, prehashed)
+
+        return _StreamingHashVerifier(self.hashfn, verify_digest)
+
 
 class _RawEC(_RawJWS):
+    supports_streaming = True
+
     def __init__(self, curve, hashfn):
         self._curve = curve
         self.hashfn = hashfn
@@ -211,6 +255,19 @@ class _RawEC(_RawJWS):
         enc_signature = ec_utils.encode_dss_signature(
             int(hexlify(r), 16), int(hexlify(s), 16))
         pkey.verify(enc_signature, payload, ec.ECDSA(self.hashfn))
+
+    def streaming_verifier(self, key, signature):
+        pkey = key.get_op_key('verify', self._curve)
+        r = signature[:len(signature) // 2]
+        s = signature[len(signature) // 2:]
+        enc_signature = ec_utils.encode_dss_signature(
+            int(hexlify(r), 16), int(hexlify(s), 16))
+        prehashed = ec_utils.Prehashed(self.hashfn)
+
+        def verify_digest(digest):
+            pkey.verify(enc_signature, digest, ec.ECDSA(prehashed))
+
+        return _StreamingHashVerifier(self.hashfn, verify_digest)
 
 
 class _RawNone(_RawJWS):

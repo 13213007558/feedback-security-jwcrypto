@@ -97,6 +97,46 @@ class InvalidJWSOperation(JWException):
         super(InvalidJWSOperation, self).__init__(msg)
 
 
+def _merge_check_headers(header_registry, protected, *headers):
+    header = None
+    crit = []
+    if protected is not None:
+        if 'crit' in protected:
+            crit = protected['crit']
+            # Check immediately if we support these critical headers
+            for k in crit:
+                if k not in header_registry:
+                    raise InvalidJWSObject(
+                        'Unknown critical header: "%s"' % k)
+                else:
+                    if not header_registry[k].supported:
+                        raise InvalidJWSObject(
+                            'Unsupported critical header: "%s"' % k)
+        header = protected
+        if 'b64' in header:
+            if not isinstance(header['b64'], bool):
+                raise InvalidJWSObject('b64 header must be a boolean')
+
+    for hn in headers:
+        if hn is None:
+            continue
+        if header is None:
+            header = {}
+        for h in list(hn.keys()):
+            if h in header_registry:
+                if header_registry[h].mustprotect:
+                    raise InvalidJWSObject('"%s" must be protected' % h)
+            if h in header:
+                raise InvalidJWSObject('Duplicate header: "%s"' % h)
+        header.update(hn)
+
+    for k in crit:
+        if k not in header:
+            raise InvalidJWSObject('Missing critical header "%s"' % k)
+
+    return header
+
+
 class JWSCore:
     """The inner JWS Core object.
 
@@ -229,43 +269,8 @@ class JWS:
     # TODO: allow caller to specify list of headers it understands
     # FIXME: Merge and check to be changed to two separate functions
     def _merge_check_headers(self, protected, *headers):
-        header = None
-        crit = []
-        if protected is not None:
-            if 'crit' in protected:
-                crit = protected['crit']
-                # Check immediately if we support these critical headers
-                for k in crit:
-                    if k not in self.header_registry:
-                        raise InvalidJWSObject(
-                            'Unknown critical header: "%s"' % k)
-                    else:
-                        if not self.header_registry[k].supported:
-                            raise InvalidJWSObject(
-                                'Unsupported critical header: "%s"' % k)
-            header = protected
-            if 'b64' in header:
-                if not isinstance(header['b64'], bool):
-                    raise InvalidJWSObject('b64 header must be a boolean')
-
-        for hn in headers:
-            if hn is None:
-                continue
-            if header is None:
-                header = {}
-            for h in list(hn.keys()):
-                if h in self.header_registry:
-                    if self.header_registry[h].mustprotect:
-                        raise InvalidJWSObject('"%s" must be protected' % h)
-                if h in header:
-                    raise InvalidJWSObject('Duplicate header: "%s"' % h)
-            header.update(hn)
-
-        for k in crit:
-            if k not in header:
-                raise InvalidJWSObject('Missing critical header "%s"' % k)
-
-        return header
+        return _merge_check_headers(
+            self.header_registry, protected, *headers)
 
     def _verify(self, alg, key, payload, signature, protected, header=None):
         p = {}
@@ -733,3 +738,247 @@ class JWS:
         except Exception:  # pylint: disable=broad-except
             payload = self.objects['payload'].decode('utf-8')
             return f'JWS(payload={payload})'
+
+
+class _StreamingBase64UrlEncoder:
+    """Incrementally base64url-encodes (unpadded) a byte stream.
+
+    Keeps at most two bytes of carry state between update() calls so
+    that arbitrary chunk boundaries produce the same output as
+    encoding the whole payload at once.
+    """
+
+    def __init__(self):
+        self._carry = b''
+
+    def update(self, chunk):
+        data = self._carry + chunk
+        end = len(data) - (len(data) % 3)
+        self._carry = data[end:]
+        if end == 0:
+            return b''
+        return base64url_encode(data[:end]).encode('utf-8')
+
+    def finalize(self):
+        out = base64url_encode(self._carry).encode('utf-8')
+        self._carry = b''
+        return out
+
+
+class JWSStreamVerifier:
+    """Streaming verifier for JWS detached signatures.
+
+    This object verifies one or more JWS signatures over a detached
+    payload that is provided as an iterator of bytes chunks, so that
+    large payloads never need to be held in memory in their entirety.
+    The payload is consumed exactly once no matter how many signatures
+    are registered; each registered signature is still checked
+    independently against its own protected header and algorithm.
+
+    Only algorithms that can verify incrementally (the RSA and ECDSA
+    signature algorithms) are supported; any other algorithm is
+    rejected when the signature is registered. The payload chunks are
+    never joined into a single buffer.
+
+    All registered signatures are required: :meth:`verify` raises if
+    any of them fails, and :attr:`is_valid` stays False in that case.
+    """
+
+    def __init__(self, allowed_algs=None, max_payload_size=None,
+                 header_registry=None):
+        """Creates a JWSStreamVerifier object.
+
+        :param allowed_algs: An optional list of allowed algorithms.
+        :param max_payload_size: An optional maximum number of payload
+            bytes accepted from the payload iterator; verification
+            aborts if more bytes are read.
+        :param header_registry: Optional additions to the header registry
+        """
+        self._allowed_algs = allowed_algs
+        self._max_payload_size = max_payload_size
+        self._signatures = []
+        self._valid = False
+        self.verifylog = None
+        self.header_registry = JWSEHeaderRegistry(JWSHeaderRegistry)
+        if header_registry:
+            self.header_registry.update(header_registry)
+
+    @property
+    def is_valid(self):
+        """True only after all registered signatures verified."""
+        return self._valid
+
+    def add_signature(self, key, signature, protected=None, header=None,
+                      alg=None):
+        """Registers a detached signature to be verified.
+
+        :param key: A (:class:`jwcrypto.jwk.JWK`) verification key.
+        :param signature: The raw signature bytes, or their base64url
+            encoding as a string (as found in a serialized JWS).
+        :param protected: The protected header. Either a string with the
+            original base64url encoding exactly as found in the
+            serialized JWS (it is preserved verbatim in the signing
+            input), or a dictionary to be JSON-encoded.
+        :param header: The unprotected header as a dictionary (optional).
+        :param alg: The expected algorithm (optional). Usually the
+            algorithm is known as it is provided with the JOSE Headers
+            of the signature.
+
+        :raises ValueError: if the key is not a (:class:`jwcrypto.jwk.JWK`)
+        :raises InvalidJWSObject: if the headers are invalid.
+        :raises InvalidJWSOperation: if the algorithm is not allowed or
+            does not support streaming verification.
+        """
+        self._valid = False
+        if not isinstance(key, JWK):
+            raise ValueError('key is not a JWK object')
+
+        if isinstance(signature, str):
+            signature = base64url_decode(signature)
+        elif not isinstance(signature, bytes):
+            raise TypeError('signature must be bytes or a base64url string')
+
+        if protected is None:
+            protected_b64 = ''
+            p = None
+        elif isinstance(protected, dict):
+            protected_b64 = base64url_encode(json_encode(protected))
+            p = protected
+        elif isinstance(protected, str):
+            # Preserve the original encoding verbatim, decode only to
+            # run the header checks.
+            protected_b64 = protected
+            p = json_decode(base64url_decode(protected).decode('utf-8'))
+            if not isinstance(p, dict):
+                raise InvalidJWSObject('Invalid Protected header')
+        else:
+            raise TypeError('protected must be a dict or a base64url string')
+
+        if header is not None and not isinstance(header, dict):
+            raise InvalidJWSObject('Invalid Unprotected header')
+
+        # Merge and check (critical) headers
+        chk_hdrs = _merge_check_headers(self.header_registry, p, header)
+        for hdr in chk_hdrs:
+            if hdr in self.header_registry:
+                if not self.header_registry.check_header(hdr, self):
+                    raise InvalidJWSObject('Failed header check')
+
+        # check 'alg' is present
+        if alg is None and (p is None or 'alg' not in p):
+            raise InvalidJWSObject('No "alg" in headers')
+        if alg:
+            if p is not None and 'alg' in p and alg != p['alg']:
+                raise InvalidJWSObject(
+                    '"alg" mismatch, requested'
+                    f''' "{alg}", found "{p['alg']}"'''
+                )
+            resulting_alg = alg
+        else:
+            resulting_alg = p['alg']
+
+        allowed = self._allowed_algs
+        if allowed is None:
+            allowed = default_allowed_algs
+        if resulting_alg not in allowed:
+            raise InvalidJWSOperation('Algorithm not allowed')
+        engine = JWA.signing_alg(resulting_alg)
+        if not engine.supports_streaming:
+            raise InvalidJWSOperation(
+                'Algorithm "%s" does not support streaming verification'
+                % resulting_alg)
+
+        b64 = True
+        if chk_hdrs is not None:
+            b64 = chk_hdrs.get('b64', True)
+
+        self._signatures.append({
+            'key': key,
+            'signature': signature,
+            'protected': protected_b64,
+            'alg': resulting_alg,
+            'engine': engine,
+            'b64': b64,
+        })
+
+    def verify(self, payload_chunks):
+        """Verifies all registered signatures in a single pass.
+
+        The payload iterator is consumed exactly once, in bounded
+        memory: chunks are processed as they arrive and are never
+        accumulated into a single buffer.
+
+        The caller retains ownership of the payload source: this method
+        never closes the provided iterable. If the iterable wraps a
+        file or another resource that must be closed, the caller is
+        responsible for closing it (for example with a context
+        manager).
+
+        :param payload_chunks: an iterable of bytes-like chunks making
+            up the detached payload, in order. An empty iterable
+            represents an empty payload.
+
+        :raises InvalidJWSSignature: if any signature fails to verify.
+        :raises InvalidJWSOperation: if the payload cannot be read or
+            exceeds the maximum payload size.
+
+        :return: Returns True if all signatures verify.
+        :rtype: `bool`
+        """
+        self._valid = False
+        self.verifylog = []
+        if not self._signatures:
+            raise InvalidJWSSignature('No signatures registered')
+
+        states = []
+        for sig in self._signatures:
+            verifier = sig['engine'].streaming_verifier(
+                sig['key'], sig['signature'])
+            verifier.update(sig['protected'].encode('utf-8') + b'.')
+            encoder = _StreamingBase64UrlEncoder() if sig['b64'] else None
+            states.append((sig, verifier, encoder))
+
+        read = 0
+        iterator = iter(payload_chunks)
+        while True:
+            try:
+                chunk = next(iterator)
+            except StopIteration:
+                break
+            except Exception as e:  # pylint: disable=broad-except
+                raise InvalidJWSOperation(
+                    'Failed to read payload stream', exception=e) from e
+            if isinstance(chunk, str) or not isinstance(
+                    chunk, (bytes, bytearray, memoryview)):
+                raise TypeError('payload chunks must be bytes-like')
+            chunk = bytes(chunk)
+            read += len(chunk)
+            if self._max_payload_size is not None and \
+                    read > self._max_payload_size:
+                raise InvalidJWSOperation(
+                    'Payload exceeds maximum size of %d bytes'
+                    % self._max_payload_size)
+            for sig, verifier, encoder in states:
+                if encoder is not None:
+                    data = encoder.update(chunk)
+                    if data:
+                        verifier.update(data)
+                else:
+                    verifier.update(chunk)
+
+        failed = 0
+        for sig, verifier, encoder in states:
+            if encoder is not None:
+                verifier.update(encoder.finalize())
+            try:
+                verifier.verify()
+                self.verifylog.append('Success')
+            except Exception as e:  # pylint: disable=broad-except
+                failed += 1
+                self.verifylog.append('Failed: [%s]' % repr(e))
+
+        if failed:
+            raise InvalidJWSSignature(
+                'Verification failed for %d signature(s)' % failed)
+        self._valid = True
+        return True

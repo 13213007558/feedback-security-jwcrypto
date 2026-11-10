@@ -18,6 +18,10 @@ Classes
    :members:
    :show-inheritance:
 
+.. autoclass:: jwcrypto.jws.JWSStreamVerifier
+   :members:
+   :show-inheritance:
+
 Variables
 ---------
 
@@ -63,3 +67,23 @@ Verify a JWS token::
     >>> jwstoken.deserialize(sig)
     >>> jwstoken.verify(key)
     >>> payload = jwstoken.payload
+
+Verify a detached JWS signature over a streamed payload (only RSA and
+ECDSA algorithms are supported). The payload iterator is consumed
+exactly once and is never closed by the verifier; if it wraps a file
+the caller closes it, e.g. by passing
+``iter(lambda: stream.read(65536), b'')`` inside a ``with`` block::
+    >>> from jwcrypto import jwk, jws
+    >>> key = jwk.JWK.generate(kty='RSA', size=2048)
+    >>> payload = b'a large attachment'
+    >>> jwstoken = jws.JWS(payload)
+    >>> jwstoken.add_signature(key, None, '{"alg":"RS256"}')
+    >>> jwstoken.detach_payload()
+    >>> protected, _, signature = jwstoken.serialize(compact=True).split('.')
+    >>> verifier = jws.JWSStreamVerifier()
+    >>> verifier.add_signature(key, signature, protected=protected)
+    >>> chunks = [payload[i:i + 7] for i in range(0, len(payload), 7)]
+    >>> verifier.verify(iter(chunks))
+    True
+    >>> verifier.is_valid
+    True
